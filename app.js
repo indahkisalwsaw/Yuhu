@@ -34,7 +34,7 @@ const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET;
 const ADMIN_ID = parseInt(process.env.ADMIN_ID) || 0;
-const PORT = process.env.PORT || 8000;
+const PORT = process.env.PORT || 4000;
 const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID;
 const DB_NAME = 'telegram_auth';
 
@@ -757,7 +757,7 @@ async function startApplication() {
         logger.info('✅ Telegram bot launched successfully!');
         
         // Start Express server
-        app.listen(PORT, () => {
+        app.listen(PORT,'0.0.0.0',() => {
             logger.info(`🌐 Express server running on port ${PORT}`);
             logger.info('📱 Bot is ready! Test with /start command');
             
