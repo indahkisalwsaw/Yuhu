@@ -1,129 +1,67 @@
+const { Telegraf } = require('telegraf');
 const express = require('express');
-const { Telegraf, Markup } = require('telegraf');
-const mongoose = require('mongoose');
+const { MongoClient } = require('mongodb');
 const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
 const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('rate-limiter-flexible');
 const winston = require('winston');
-const axios = require('axios');
-const moment = require('moment');
-const fs = require('fs');
-const path = require('path');
+const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
 // ====================================
-// CONFIGURATION & SETUP
+// LOGGING SETUP
 // ====================================
-
-const PORT = process.env.PORT || 8000;
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID;
-const JWT_SECRET = process.env.JWT_SECRET;
-const ADMIN_ID = parseInt(process.env.ADMIN_ID) || 0;
-const MONGODB_URI = process.env.MONGODB_URI;
-
-// Logger setup
 const logger = winston.createLogger({
     level: 'info',
     format: winston.format.combine(
         winston.format.timestamp(),
         winston.format.errors({ stack: true }),
-        winston.format.json()
-    ),
-    defaultMeta: { service: 'telegram-bot-api' },
-    transports: [
-        new winston.transports.File({ filename: 'error.log', level: 'error' }),
-        new winston.transports.File({ filename: 'combined.log' }),
-        new winston.transports.Console({
-            format: winston.format.simple()
+        winston.format.printf(({ timestamp, level, message, stack }) => {
+            return `${timestamp} [${level.toUpperCase()}]: ${stack || message}`;
         })
+    ),
+    transports: [
+        new winston.transports.Console({
+            format: winston.format.colorize({ all: true })
+        }),
+        new winston.transports.File({ filename: 'bot.log' })
     ]
 });
 
-// Rate limiting
-const rateLimiter = new rateLimit.RateLimiterMemory({
-    keyGenerator: (req) => req.ip,
-    points: 10, // Number of requests
-    duration: 60, // Per 60 seconds
-});
-
-// Global variables
-let maintenanceMode = false;
-const notificationHistory = new Map();
-const bannedIPs = new Set();
-const recentRequests = new Map();
-
 // ====================================
-// MONGODB MODELS
+// ENVIRONMENT VARIABLES
 // ====================================
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const MONGODB_URI = process.env.MONGODB_URI;
+const JWT_SECRET = process.env.JWT_SECRET;
+const ADMIN_ID = parseInt(process.env.ADMIN_ID) || 0;
+const PORT = process.env.PORT || 8000;
+const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID;
+const DB_NAME = 'telegram_auth';
 
-// User Schema
-const userSchema = new mongoose.Schema({
-    telegramId: { type: Number, required: true, unique: true },
-    username: String,
-    firstName: String,
-    lastName: String,
-    accessToken: String,
-    tokenCreatedAt: Date,
-    createdAt: { type: Date, default: Date.now },
-    updatedAt: { type: Date, default: Date.now },
-    isActive: { type: Boolean, default: true }
-});
+// Validate required environment variables
+if (!BOT_TOKEN) {
+    logger.error('❌ TELEGRAM_BOT_TOKEN is required');
+    process.exit(1);
+}
 
-const User = mongoose.model('User', userSchema);
-
-// Notification Schema
-const notificationSchema = new mongoose.Schema({
-    userId: Number,
-    username: String,
-    data: Object,
-    screenshot: String,
-    sentAt: { type: Date, default: Date.now },
-    status: { type: String, default: 'sent' }
-});
-
-const Notification = mongoose.model('Notification', notificationSchema);
-
-// ====================================
-// DATABASE CONNECTION
-// ====================================
-
-async function connectDB() {
-    try {
-        await mongoose.connect(MONGODB_URI);
-        logger.info('✅ Connected to MongoDB successfully');
-    } catch (error) {
-        logger.error('❌ MongoDB connection error:', error);
-        process.exit(1);
-    }
+if (!JWT_SECRET) {
+    logger.error('❌ JWT_SECRET is required');
+    process.exit(1);
 }
 
 // ====================================
-// TELEGRAM BOT SETUP
+// GLOBAL VARIABLES
 // ====================================
-
-const bot = new Telegraf(BOT_TOKEN);
-
-// Middleware untuk maintenance mode
-bot.use(async (ctx, next) => {
-    if (maintenanceMode && ctx.from.id !== ADMIN_ID) {
-        return ctx.reply('🔧 Bot is currently under maintenance. Please try again later.');
-    }
-    return next();
-});
-
-// Error handling
-bot.catch((err, ctx) => {
-    logger.error(`❌ Bot error for ${ctx.updateType}:`, err);
-});
+let bot = null;
+let app = null;
+let mongoClient = null;
+let db = null;
+let isShuttingDown = false;
+let botStarted = false;
 
 // ====================================
 // UTILITY FUNCTIONS
 // ====================================
-
-// Generate JWT token
 function generateAccessToken(userId) {
     return jwt.sign(
         { 
@@ -134,7 +72,6 @@ function generateAccessToken(userId) {
     );
 }
 
-// Verify JWT token
 function verifyToken(token) {
     try {
         return jwt.verify(token, JWT_SECRET);
@@ -143,567 +80,754 @@ function verifyToken(token) {
     }
 }
 
-// Check if user is admin
 function isAdmin(userId) {
     return userId === ADMIN_ID;
 }
 
-// Escape markdown characters
 function escapeMarkdown(text) {
     return text.replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
 }
 
-// Load banned IPs
-function loadBannedIPs() {
-    try {
-        if (fs.existsSync('banned.txt')) {
-            const data = fs.readFileSync('banned.txt', 'utf8');
-            const ips = data.split('\n').filter(ip => ip.trim() && ip.trim() !== '127.0.0.1');
-            ips.forEach(ip => bannedIPs.add(ip.trim()));
-            logger.info(`📝 Loaded ${bannedIPs.size} banned IPs`);
-        }
-    } catch (error) {
-        logger.error('Error loading banned IPs:', error);
-    }
-}
-
-// Save banned IP
-function saveBannedIP(ip) {
-    if (ip === '127.0.0.1') return;
-    
-    try {
-        fs.appendFileSync('banned.txt', ip + '\n');
-        logger.info(`🚫 IP ${ip} added to banned list`);
-    } catch (error) {
-        logger.error('Error saving banned IP:', error);
-    }
-}
-
-// Check duplicate requests
-function isDuplicateRequest(requestId) {
-    if (!requestId) return false;
-    
-    const now = Date.now();
-    const fiveMinutesAgo = now - (5 * 60 * 1000);
-    
-    // Clean old requests
-    for (const [id, timestamp] of recentRequests.entries()) {
-        if (timestamp < fiveMinutesAgo) {
-            recentRequests.delete(id);
-        }
-    }
-    
-    if (recentRequests.has(requestId)) {
-        return true;
-    }
-    
-    recentRequests.set(requestId, now);
-    return false;
-}
-
 // ====================================
-// TELEGRAM BOT COMMANDS
+// MONGODB CONNECTION (Native Driver)
 // ====================================
-
-// /start command
-bot.start(async (ctx) => {
-    const user = ctx.from;
-    
+async function connectMongoDB() {
     try {
-        // Update or create user
-        await User.findOneAndUpdate(
-            { telegramId: user.id },
-            {
-                telegramId: user.id,
-                username: user.username,
-                firstName: user.first_name,
-                lastName: user.last_name,
-                updatedAt: new Date()
-            },
-            { upsert: true, new: true }
-        );
+        if (!MONGODB_URI) {
+            logger.warn('⚠️  MongoDB URI not provided, running without database');
+            return false;
+        }
 
-        const welcomeMessage = `🤖 **Welcome ${user.first_name}!**
-
-I'm your authentication bot. I can help you generate secure access tokens for API authentication.
-
-**Available Commands:**
-• \`/getaccess\` - Generate your access token
-• \`/verify <token>\` - Verify a token
-• \`/revoke\` - Revoke your current token
-• \`/stats\` - View your account statistics
-• \`/help\` - Show this help message
-
-Need assistance? Just ask me anything!`;
-
-        await ctx.replyWithMarkdownV2(welcomeMessage);
-        logger.info(`👤 New user started bot: ${user.id} (${user.username})`);
-
-    } catch (error) {
-        logger.error('Error in start command:', error);
-        await ctx.reply('❌ An error occurred. Please try again.');
-    }
-});
-
-// /getaccess command
-bot.command('getaccess', async (ctx) => {
-    const user = ctx.from;
-    
-    try {
-        // Generate new token
-        const accessToken = generateAccessToken(user.id);
+        logger.info('🔄 Connecting to MongoDB...');
+        logger.info(`🔗 URI: ${MONGODB_URI.replace(/:[^:]*@/, ':***@')}`);
         
-        // Update user with new token
-        await User.findOneAndUpdate(
-            { telegramId: user.id },
-            {
-                accessToken: accessToken,
-                tokenCreatedAt: new Date(),
-                updatedAt: new Date()
-            },
-            { upsert: true }
+        // Connection options
+        const options = {
+            serverSelectionTimeoutMS: 10000,
+            socketTimeoutMS: 30000,
+            connectTimeoutMS: 10000,
+            maxPoolSize: 10,
+            retryWrites: true,
+            w: 'majority'
+        };
+
+        // Create MongoDB client
+        mongoClient = new MongoClient(MONGODB_URI, options);
+        
+        // Connect with timeout
+        const connectionPromise = mongoClient.connect();
+        const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Connection timeout after 15 seconds')), 15000)
         );
 
-        const message = `🔐 **New Access Token Generated**
+        await Promise.race([connectionPromise, timeoutPromise]);
+
+        // Get database
+        db = mongoClient.db(DB_NAME);
+        
+        // Test connection
+        await db.admin().ping();
+        
+        logger.info('✅ Connected to MongoDB successfully');
+        logger.info(`📊 Database: ${DB_NAME}`);
+        logger.info(`🌐 Host: ${mongoClient.s.options.hosts[0]}`);
+        
+        return true;
+
+    } catch (error) {
+        logger.error('❌ MongoDB connection failed:', {
+            message: error.message,
+            code: error.code
+        });
+        
+        // Specific error handling
+        if (error.message.includes('ENOTFOUND')) {
+            logger.error('🌐 DNS Resolution failed - Check internet connection');
+        } else if (error.message.includes('ECONNREFUSED')) {
+            logger.error('🚫 Connection refused - Check MongoDB service');
+        } else if (error.message.includes('Authentication failed')) {
+            logger.error('🔐 Authentication failed - Check username/password');
+        } else if (error.message.includes('timeout')) {
+            logger.error('⏰ Connection timeout - Check network/firewall');
+        }
+        
+        logger.warn('⚠️  Continuing without database...');
+        return false;
+    }
+}
+
+// ====================================
+// DATABASE HELPER FUNCTIONS
+// ====================================
+async function findUser(telegramId) {
+    if (!db) return null;
+    try {
+        return await db.collection('users').findOne({ telegramId: telegramId });
+    } catch (error) {
+        logger.error('❌ Error finding user:', error);
+        return null;
+    }
+}
+
+async function saveUser(userData) {
+    if (!db) return null;
+    try {
+        return await db.collection('users').findOneAndUpdate(
+            { telegramId: userData.telegramId },
+            { 
+                $set: {
+                    ...userData,
+                    updatedAt: new Date()
+                },
+                $setOnInsert: { createdAt: new Date() }
+            },
+            { upsert: true, returnDocument: 'after' }
+        );
+    } catch (error) {
+        logger.error('❌ Error saving user:', error);
+        return null;
+    }
+}
+
+async function saveNotification(notificationData) {
+    if (!db) return null;
+    try {
+        return await db.collection('notifications').insertOne({
+            ...notificationData,
+            sentAt: new Date()
+        });
+    } catch (error) {
+        logger.error('❌ Error saving notification:', error);
+        return null;
+    }
+}
+
+async function getUserStats(telegramId) {
+    if (!db) return { user: null, notificationCount: 0 };
+    try {
+        const user = await findUser(telegramId);
+        const notificationCount = await db.collection('notifications').countDocuments({ 
+            userId: telegramId 
+        });
+        return { user, notificationCount };
+    } catch (error) {
+        logger.error('❌ Error getting stats:', error);
+        return { user: null, notificationCount: 0 };
+    }
+}
+
+// ====================================
+// TELEGRAM BOT SETUP
+// ====================================
+function setupTelegramBot() {
+    logger.info('🤖 Setting up Telegram bot...');
+    
+    bot = new Telegraf(BOT_TOKEN);
+
+    // /start command
+    bot.start(async (ctx) => {
+        const user = ctx.from;
+        logger.info(`📨 /start command from ${user.first_name} (${user.id})`);
+        
+        try {
+            // Save user to database
+            if (db) {
+                await saveUser({
+                    telegramId: user.id,
+                    username: user.username,
+                    firstName: user.first_name,
+                    lastName: user.last_name
+                });
+            }
+
+            const welcomeMessage = `🤖 **Selamat datang ${user.first_name}!**
+
+Saya adalah bot autentikasi Anda. Saya dapat membantu Anda:
+
+**🔐 Perintah Utama:**
+• \`/getaccess\` - Generate access token
+• \`/verify <token>\` - Verifikasi token
+• \`/revoke\` - Hapus token aktif  
+• \`/stats\` - Lihat statistik akun
+• \`/help\` - Tampilkan bantuan
+
+**⚡ Test Commands:**
+• \`/ping\` - Test responsivitas bot
+• \`/status\` - Status sistem bot
+
+Mulai dengan mengetik /help untuk informasi lebih lanjut!`;
+
+            await ctx.replyWithMarkdownV2(escapeMarkdown(welcomeMessage));
+            logger.info(`✅ Welcome message sent to ${user.first_name}`);
+
+        } catch (error) {
+            logger.error('❌ Error in start command:', error);
+            await ctx.reply('❌ Terjadi kesalahan. Silakan coba lagi.');
+        }
+    });
+
+    // /help command
+    bot.help(async (ctx) => {
+        logger.info(`📨 /help command from ${ctx.from.first_name}`);
+        
+        const helpMessage = `📚 **Bantuan Bot**
+
+**🔐 Perintah Autentikasi:**
+• \`/start\` - Mulai menggunakan bot
+• \`/getaccess\` - Generate token akses baru
+• \`/verify <token>\` - Cek validitas token
+• \`/revoke\` - Hapus token yang aktif
+
+**📊 Informasi:**
+• \`/stats\` - Statistik akun Anda
+• \`/help\` - Tampilkan pesan ini
+
+**⚡ Testing:**
+• \`/ping\` - Test response time
+• \`/status\` - Status sistem
+
+**💡 Cara Menggunakan:**
+1\\. Generate token dengan \`/getaccess\`
+2\\. Gunakan token di header API: \`Authorization: Bearer <token>\`
+3\\. Token berlaku selama 7 hari
+
+**🔒 Keamanan:**
+• Jangan bagikan token Anda
+• Generate token baru jika terjadi kebocoran
+• Token otomatis expired setelah 7 hari`;
+
+        await ctx.replyWithMarkdownV2(escapeMarkdown(helpMessage));
+    });
+
+    // /ping command
+    bot.command('ping', async (ctx) => {
+        const startTime = Date.now();
+        logger.info(`📨 /ping from ${ctx.from.first_name}`);
+        
+        const message = await ctx.reply('🏓 Pong!');
+        const responseTime = Date.now() - startTime;
+        
+        await ctx.telegram.editMessageText(
+            ctx.chat.id,
+            message.message_id,
+            null,
+            `🏓 Pong!\n⚡ Response time: ${responseTime}ms\n🕐 Server time: ${new Date().toLocaleString('id-ID')}`
+        );
+    });
+
+    // /status command
+    bot.command('status', async (ctx) => {
+        logger.info(`📨 /status from ${ctx.from.first_name}`);
+        
+        const uptime = process.uptime();
+        const memory = process.memoryUsage();
+        const dbStatus = db ? '✅ Connected' : '❌ Disconnected';
+        
+        const statusMessage = `🔧 **Status Sistem**
+
+**⚡ Bot Status:** 🟢 Online
+**🕐 Uptime:** ${Math.floor(uptime/3600)}h ${Math.floor((uptime%3600)/60)}m ${Math.floor(uptime%60)}s
+**💾 Memory Usage:** ${Math.round(memory.heapUsed/1024/1024)}MB / ${Math.round(memory.heapTotal/1024/1024)}MB
+**🗄️ Database:** ${dbStatus}
+**📡 API Server:** 🟢 Running on port ${PORT}
+**🤖 Bot Version:** 1.0.0
+
+**📊 Process Info:**
+• **Node.js:** ${process.version}
+• **Platform:** ${process.platform}
+• **PID:** ${process.pid}`;
+
+        await ctx.replyWithMarkdownV2(escapeMarkdown(statusMessage));
+    });
+
+    // /getaccess command
+    bot.command('getaccess', async (ctx) => {
+        const user = ctx.from;
+        logger.info(`📨 /getaccess from ${user.first_name} (${user.id})`);
+        
+        try {
+            // Generate new access token
+            const accessToken = generateAccessToken(user.id);
+            
+            // Save to database
+            if (db) {
+                await saveUser({
+                    telegramId: user.id,
+                    username: user.username,
+                    firstName: user.first_name,
+                    lastName: user.last_name,
+                    accessToken: accessToken,
+                    tokenCreatedAt: new Date()
+                });
+            }
+
+            const tokenMessage = `🔐 **Access Token Generated**
 
 \`${escapeMarkdown(accessToken)}\`
 
-⏰ **Expires:** 7 days from now
-📋 **Usage:** Include in Authorization header as Bearer token
+**📋 Informasi:**
+• **Berlaku:** 7 hari dari sekarang
+• **Penggunaan:** Header Authorization Bearer
+• **Status:** Token lama telah di\\-revoke
 
-⚠️ **Note:** Your previous token has been revoked.`;
+**💡 Contoh Penggunaan:**
+\`\`\`
+Authorization: Bearer ${escapeMarkdown(accessToken.substring(0, 20))}...
+\`\`\`
 
-        await ctx.replyWithMarkdownV2(message);
-        logger.info(`🔑 New token generated for user: ${user.id}`);
+⚠️ **Penting:** Simpan token ini dengan aman\\!`;
 
-    } catch (error) {
-        logger.error('Error in getaccess command:', error);
-        await ctx.reply('❌ Error generating access token. Please try again.');
-    }
-});
+            await ctx.replyWithMarkdownV2(tokenMessage);
+            logger.info(`✅ Access token generated for ${user.first_name}`);
 
-// /verify command
-bot.command('verify', async (ctx) => {
-    const args = ctx.message.text.split(' ').slice(1);
-    
-    if (args.length === 0) {
-        return ctx.reply('❌ Please provide a token to verify.\n\nUsage: `/verify <token>`');
-    }
+        } catch (error) {
+            logger.error('❌ Error generating access token:', error);
+            await ctx.reply('❌ Gagal generate token. Silakan coba lagi.');
+        }
+    });
 
-    const token = args[0];
-    
-    try {
-        const decoded = verifyToken(token);
+    // /verify command
+    bot.command('verify', async (ctx) => {
+        const args = ctx.message.text.split(' ').slice(1);
+        const user = ctx.from;
         
-        if (!decoded) {
-            return ctx.reply('❌ **Invalid Token**\n\nToken is malformed or has expired.');
+        if (args.length === 0) {
+            return ctx.reply('❌ Silakan berikan token untuk diverifikasi.\n\n**Usage:** `/verify <token>`');
         }
 
-        // Check if token exists in database
-        const user = await User.findOne({ accessToken: token });
+        const token = args[0];
+        logger.info(`📨 /verify from ${user.first_name}`);
         
-        if (user) {
-            const expDate = new Date(decoded.exp * 1000);
-            const message = `✅ **Token Valid**
-
-👤 **User ID:** ${decoded.userId}
-⏰ **Expires:** ${moment(expDate).format('YYYY-MM-DD HH:mm:ss')}
-📅 **Created:** ${moment(user.tokenCreatedAt).format('YYYY-MM-DD HH:mm:ss')}`;
-
-            await ctx.reply(message);
-        } else {
-            await ctx.reply('❌ **Token Invalid**\n\nToken not found or has been revoked.');
-        }
-
-    } catch (error) {
-        logger.error('Error in verify command:', error);
-        await ctx.reply('❌ Error verifying token. Please try again.');
-    }
-});
-
-// /revoke command
-bot.command('revoke', async (ctx) => {
-    const user = ctx.from;
-    
-    try {
-        const result = await User.findOneAndUpdate(
-            { telegramId: user.id },
-            {
-                $unset: { accessToken: "", tokenCreatedAt: "" },
-                updatedAt: new Date()
-            }
-        );
-
-        if (result && result.accessToken) {
-            await ctx.reply('✅ **Token Revoked Successfully**\n\nYour access token has been revoked. Generate a new one with `/getaccess`');
-        } else {
-            await ctx.reply('ℹ️ **No Active Token**\n\nNo active token found to revoke.');
-        }
-
-        logger.info(`🗑️ Token revoked for user: ${user.id}`);
-
-    } catch (error) {
-        logger.error('Error in revoke command:', error);
-        await ctx.reply('❌ Error revoking token. Please try again.');
-    }
-});
-
-// /stats command
-bot.command('stats', async (ctx) => {
-    const user = ctx.from;
-    
-    try {
-        const userData = await User.findOne({ telegramId: user.id });
-        
-        if (userData) {
-            const notificationCount = await Notification.countDocuments({ userId: user.id });
-            const hasToken = !!userData.accessToken;
+        try {
+            const decoded = verifyToken(token);
             
-            const message = `📊 **Your Statistics**
+            if (!decoded) {
+                return ctx.reply('❌ **Token Invalid**\n\nToken tidak valid atau sudah expired.');
+            }
 
-👤 **User ID:** ${user.id}
-📅 **Joined:** ${moment(userData.createdAt).format('YYYY-MM-DD HH:mm:ss')}
-🔄 **Last Updated:** ${moment(userData.updatedAt).format('YYYY-MM-DD HH:mm:ss')}
-🔐 **Active Token:** ${hasToken ? 'Yes' : 'No'}
-🆕 **Token Created:** ${userData.tokenCreatedAt ? moment(userData.tokenCreatedAt).format('YYYY-MM-DD HH:mm:ss') : 'Never'}
-📬 **Notifications Sent:** ${notificationCount}`;
+            // Check in database
+            let dbUser = null;
+            if (db) {
+                dbUser = await db.collection('users').findOne({ accessToken: token });
+            }
+            
+            const expDate = new Date(decoded.exp * 1000);
+            const now = new Date();
+            const timeLeft = Math.floor((expDate - now) / (1000 * 60 * 60 * 24));
+            
+            let verificationMessage = `✅ **Token Valid**
 
-            await ctx.reply(message);
-        } else {
-            await ctx.reply('❌ **No Data Found**\n\nPlease use `/start` to initialize your account.');
+**👤 User ID:** ${decoded.userId}
+**⏰ Expires:** ${expDate.toLocaleString('id-ID')}
+**📅 Time Left:** ${timeLeft} hari`;
+
+            if (dbUser) {
+                verificationMessage += `\n**📊 Created:** ${dbUser.tokenCreatedAt?.toLocaleString('id-ID') || 'Unknown'}`;
+            }
+
+            await ctx.replyWithMarkdownV2(escapeMarkdown(verificationMessage));
+
+        } catch (error) {
+            logger.error('❌ Error verifying token:', error);
+            await ctx.reply('❌ Error saat verifikasi token.');
         }
+    });
 
-    } catch (error) {
-        logger.error('Error in stats command:', error);
-        await ctx.reply('❌ Error retrieving statistics. Please try again.');
-    }
-});
+    // /revoke command
+    bot.command('revoke', async (ctx) => {
+        const user = ctx.from;
+        logger.info(`📨 /revoke from ${user.first_name}`);
+        
+        try {
+            let revoked = false;
+            
+            if (db) {
+                const result = await db.collection('users').findOneAndUpdate(
+                    { telegramId: user.id },
+                    { 
+                        $unset: { accessToken: "", tokenCreatedAt: "" },
+                        $set: { updatedAt: new Date() }
+                    }
+                );
+                revoked = result && result.accessToken;
+            }
 
-// /maintenance command (admin only)
-bot.command('maintenance', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) {
-        return ctx.reply('❌ **Access Denied**\n\nThis command is for administrators only.');
-    }
+            if (revoked || !db) {
+                await ctx.reply('✅ **Token Berhasil Di-revoke**\n\nToken akses Anda telah dihapus. Generate token baru dengan `/getaccess`');
+            } else {
+                await ctx.reply('ℹ️ **Tidak Ada Token Aktif**\n\nTidak ditemukan token aktif untuk di-revoke.');
+            }
 
-    maintenanceMode = !maintenanceMode;
-    const status = maintenanceMode ? 'enabled' : 'disabled';
-    
-    await ctx.reply(`🔧 **Maintenance Mode ${status.charAt(0).toUpperCase() + status.slice(1)}**\n\nBot maintenance mode is now ${status}.`);
-    logger.info(`🔧 Maintenance mode ${status} by admin: ${ctx.from.id}`);
-});
+        } catch (error) {
+            logger.error('❌ Error revoking token:', error);
+            await ctx.reply('❌ Error saat revoke token.');
+        }
+    });
 
-// /help command
-bot.command('help', async (ctx) => {
-    const helpText = `🤖 **Bot Help & Commands**
+    // /stats command
+    bot.command('stats', async (ctx) => {
+        const user = ctx.from;
+        logger.info(`📨 /stats from ${user.first_name}`);
+        
+        try {
+            const { user: userData, notificationCount } = await getUserStats(user.id);
 
-**🔐 Authentication Commands:**
-• \`/start\` - Initialize your account
-• \`/getaccess\` - Generate new access token
-• \`/verify <token>\` - Verify token validity
-• \`/revoke\` - Revoke current token
+            let statsMessage = `📊 **Statistik Akun**
 
-**📊 Information Commands:**
-• \`/stats\` - View your account statistics
-• \`/help\` - Show this help message
+**👤 User Info:**
+• **Telegram ID:** ${user.id}
+• **Username:** @${user.username || 'tidak ada'}
+• **Nama:** ${user.first_name} ${user.last_name || ''}`;
 
-**🔧 API Usage:**
-1\\. Get your token with \`/getaccess\`
-2\\. Include in API requests as:
-   \`Authorization: Bearer <your_token>\`
+            if (userData) {
+                const hasToken = !!userData.accessToken;
+                statsMessage += `
 
-**📞 Support:**
-If you need help, contact the administrator or check the documentation\\.
+**📋 Account Data:**
+• **Bergabung:** ${userData.createdAt?.toLocaleDateString('id-ID') || 'Unknown'}
+• **Update Terakhir:** ${userData.updatedAt?.toLocaleDateString('id-ID') || 'Unknown'}
+• **Token Aktif:** ${hasToken ? '✅ Ya' : '❌ Tidak'}
+• **Token Dibuat:** ${userData.tokenCreatedAt?.toLocaleDateString('id-ID') || 'Belum pernah'}
+• **📬 Notifikasi:** ${notificationCount} pesan`;
+            } else {
+                statsMessage += `\n\n**⚠️ Database:** Data tidak tersedia`;
+            }
 
-**🔒 Security:**
-• Tokens expire in 7 days
-• Keep your token secure
-• Generate new token if compromised`;
+            await ctx.replyWithMarkdownV2(escapeMarkdown(statsMessage));
 
-    await ctx.replyWithMarkdownV2(helpText);
-});
+        } catch (error) {
+            logger.error('❌ Error getting stats:', error);
+            await ctx.reply('❌ Error saat mengambil statistik.');
+        }
+    });
 
-// Handle text messages
-bot.on('text', async (ctx) => {
-    const text = ctx.message.text.toLowerCase();
-    const user = ctx.from;
+    // Handle text messages
+    bot.on('text', async (ctx) => {
+        const text = ctx.message.text.toLowerCase();
+        const user = ctx.from;
+        
+        logger.info(`📝 Text from ${user.first_name}: ${ctx.message.text}`);
+        
+        if (text.includes('hello') || text.includes('halo') || text.includes('hi')) {
+            await ctx.reply(`👋 Halo ${user.first_name}! Selamat datang!\n\nKetik /help untuk melihat perintah yang tersedia.`);
+        } else if (text.includes('help') || text.includes('bantuan')) {
+            await ctx.reply('📚 Ketik /help untuk melihat daftar perintah lengkap.');
+        } else if (text.includes('token')) {
+            await ctx.reply('🔐 Untuk mendapatkan access token, gunakan perintah `/getaccess`');
+        } else if (text.includes('ping')) {
+            await ctx.reply('🏓 Pong! Gunakan `/ping` untuk response time test.');
+        } else {
+            await ctx.reply('🤔 Maaf, saya tidak mengerti pesan tersebut.\n\nKetik /help untuk melihat perintah yang tersedia.');
+        }
+    });
 
-    if (text.includes('hello') || text.includes('hi')) {
-        await ctx.reply(`Hello ${user.first_name}! 👋\n\nUse /help to see available commands.`);
-    } else if (text.includes('help')) {
-        await ctx.telegram.callApi('sendMessage', {
-            chat_id: ctx.chat.id,
-            text: '/help'
-        });
-    } else if (text.includes('token')) {
-        await ctx.reply('🔐 To get your access token, use the `/getaccess` command.');
-    } else {
-        await ctx.reply("🤔 I didn't understand that. Use `/help` to see available commands.");
-    }
-});
+    // Error handling
+    bot.catch((err, ctx) => {
+        logger.error('❌ Bot error occurred:', err);
+        if (ctx) {
+            ctx.reply('❌ Terjadi kesalahan internal. Silakan coba lagi.').catch(() => {});
+        }
+    });
+
+    return bot;
+}
 
 // ====================================
 // EXPRESS API SETUP
 // ====================================
+function setupExpressApp() {
+    logger.info('🌐 Setting up Express server...');
+    
+    app = express();
 
-const app = express();
+    // Middleware
+    app.use(express.json({ limit: '10mb' }));
+    app.use(express.urlencoded({ extended: true }));
+    app.use(cors());
 
-// Middleware
-app.use(helmet());
-app.use(cors({
-    origin: ['chrome-extension://*'],
-    credentials: true
-}));
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-
-// Rate limiting middleware
-app.use(async (req, res, next) => {
-    try {
-        await rateLimiter.consume(req.ip);
-        next();
-    } catch (rejRes) {
-        const secs = Math.round(rejRes.msBeforeNext / 1000) || 1;
-        res.set('Retry-After', String(secs));
-        
-        // Add to banned list if too many requests
-        if (req.ip !== '127.0.0.1') {
-            bannedIPs.add(req.ip);
-            saveBannedIP(req.ip);
-        }
-        
-        res.status(429).json({ error: 'Too many requests', message: 'Rate limit exceeded' });
-    }
-});
-
-// IP blocking middleware
-app.use((req, res, next) => {
-    const clientIP = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 
-                     req.headers['x-real-ip'] || 
-                     req.connection.remoteAddress || 
-                     req.ip;
-
-    if (bannedIPs.has(clientIP) && clientIP !== '127.0.0.1') {
-        return res.status(403).json({ 
-            error: 'Access denied', 
-            message: 'IP address is banned' 
-        });
-    }
-
-    req.clientIP = clientIP;
-    next();
-});
-
-// ====================================
-// API ROUTES
-// ====================================
-
-// Health check
-app.get('/', (req, res) => {
-    res.json({
-        status: 'ok',
-        timestamp: new Date().toISOString(),
-        message: 'Server is running',
-        client_ip: req.clientIP,
-        maintenance_mode: maintenanceMode,
-        bot_status: 'running'
+    // Rate limiting
+    const limiter = rateLimit({
+        windowMs: 15 * 60 * 1000,
+        max: 100,
+        message: 'Too many requests, please try again later.'
     });
-});
+    app.use('/api/', limiter);
 
-// Verify token endpoint
-app.get('/api/verify', async (req, res) => {
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader) {
-        return res.status(401).json({ error: 'No token provided' });
-    }
-
-    const token = authHeader.replace('Bearer ', '');
-    
-    try {
-        const decoded = verifyToken(token);
-        
-        if (!decoded) {
-            return res.status(401).json({ error: 'Invalid or expired token' });
-        }
-
-        // Check if token exists in database
-        const user = await User.findOne({ accessToken: token });
-        
-        if (!user) {
-            return res.status(401).json({ error: 'Token not found or has been revoked' });
-        }
-
+    // Health check
+    app.get('/', (req, res) => {
         res.json({
-            telegram_id: user.telegramId,
-            username: user.username,
-            first_name: user.firstName,
-            created_at: user.createdAt,
-            token_created_at: user.tokenCreatedAt
+            status: 'ok',
+            bot_status: botStarted ? 'running' : 'stopped',
+            database: db ? 'connected' : 'disconnected',
+            timestamp: new Date().toISOString(),
+            uptime: process.uptime(),
+            memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB'
         });
+    });
 
-    } catch (error) {
-        logger.error('Token verification error:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
+    // API token verification
+    app.get('/api/verify', async (req, res) => {
+        const authHeader = req.headers.authorization;
+        
+        if (!authHeader) {
+            return res.status(401).json({ error: 'No token provided' });
+        }
 
-// Send notification endpoint
-app.post('/send-notification', async (req, res) => {
-    try {
-        const { data = {}, screenshot, username = 'Anonymous', userTelegramId, tgForwardEnabled = true, requestId } = req.body;
+        const token = authHeader.replace('Bearer ', '');
+        
+        try {
+            const decoded = verifyToken(token);
+            
+            if (!decoded) {
+                return res.status(401).json({ error: 'Invalid or expired token' });
+            }
 
-        // Check for duplicate requests
-        if (requestId && isDuplicateRequest(requestId)) {
-            return res.json({
+            // Check in database
+            let user = null;
+            if (db) {
+                user = await db.collection('users').findOne({ accessToken: token });
+                if (!user) {
+                    return res.status(401).json({ error: 'Token not found or revoked' });
+                }
+            }
+
+            res.json({
+                valid: true,
+                telegram_id: decoded.userId,
+                expires_at: new Date(decoded.exp * 1000).toISOString(),
+                user_info: user ? {
+                    username: user.username,
+                    first_name: user.firstName,
+                    created_at: user.createdAt
+                } : null
+            });
+
+        } catch (error) {
+            logger.error('❌ Token verification error:', error);
+            res.status(500).json({ error: 'Internal server error' });
+        }
+    });
+
+    // Send notification endpoint
+    app.post('/send-notification', async (req, res) => {
+        try {
+            const { 
+                data = {}, 
+                screenshot, 
+                username = 'Anonymous', 
+                userTelegramId, 
+                tgForwardEnabled = true 
+            } = req.body;
+
+            // Create notification message
+            const businessUrl = data.businessUrl || '';
+            const successUrl = data.successUrl || '';
+            const amount = data.amount || 'Unknown';
+
+            let message = `🔔 **Payment Notification**\n\n`;
+            message += `👤 **User:** ${username}\n`;
+            if (businessUrl) message += `🏢 **Business:** ${businessUrl}\n`;
+            if (successUrl) message += `✅ **Success Page:** ${successUrl}\n`;
+            if (amount !== 'Unknown') message += `💰 **Amount:** ${amount}\n`;
+            message += `⏰ **Time:** ${new Date().toLocaleString('id-ID')}`;
+
+            // Send to user's personal chat
+            if (userTelegramId && tgForwardEnabled && bot) {
+                try {
+                    await bot.telegram.sendMessage(userTelegramId, message, { 
+                        parse_mode: 'Markdown' 
+                    });
+                } catch (botError) {
+                    logger.error('❌ Error sending to user:', botError);
+                }
+            }
+
+            // Send to group chat
+            if (GROUP_CHAT_ID && bot) {
+                try {
+                    await bot.telegram.sendMessage(GROUP_CHAT_ID, message, { 
+                        parse_mode: 'Markdown' 
+                    });
+                } catch (botError) {
+                    logger.error('❌ Error sending to group:', botError);
+                }
+            }
+
+            // Save notification to database
+            if (db) {
+                await saveNotification({
+                    userId: userTelegramId,
+                    username,
+                    data,
+                    status: 'sent'
+                });
+            }
+
+            res.json({
                 success: true,
-                message: 'Duplicate request ignored',
+                message: 'Notification sent successfully',
                 timestamp: new Date().toISOString()
             });
+
+            logger.info(`📬 Notification sent for user: ${username}`);
+
+        } catch (error) {
+            logger.error('❌ Send notification error:', error);
+            res.status(500).json({ 
+                success: false, 
+                error: 'Failed to send notification',
+                message: error.message 
+            });
         }
+    });
 
-        // Create notification message
-        const businessUrl = data.businessUrl || '';
-        const successUrl = data.successUrl || '';
-        const paymentMethod = data.paymentMethod || 'Unknown';
-        const amount = data.amount || 'Unknown';
+    // API stats
+    app.get('/api/stats', async (req, res) => {
+        try {
+            let stats = {
+                bot_status: botStarted ? 'running' : 'stopped',
+                database_status: db ? 'connected' : 'disconnected',
+                uptime: process.uptime(),
+                memory_usage: process.memoryUsage(),
+                timestamp: new Date().toISOString()
+            };
 
-        let message = `🔔 <b>Payment Notification</b>\n\n`;
-        message += `👤 <b>User:</b> ${username}\n`;
-        if (businessUrl) message += `🏢 <b>Business:</b> ${businessUrl}\n`;
-        if (successUrl) message += `✅ <b>Success Page:</b> ${successUrl}\n`;
-        if (paymentMethod !== 'Unknown') message += `💳 <b>Payment Method:</b> ${paymentMethod}\n`;
-        if (amount !== 'Unknown') message += `💰 <b>Amount:</b> ${amount}\n`;
-        message += `⏰ <b>Time:</b> ${moment().format('YYYY-MM-DD HH:mm:ss')}`;
+            if (db) {
+                const totalUsers = await db.collection('users').countDocuments({});
+                const activeTokens = await db.collection('users').countDocuments({ 
+                    accessToken: { $exists: true } 
+                });
+                const totalNotifications = await db.collection('notifications').countDocuments({});
 
-        // Send to user's personal chat
-        if (userTelegramId && tgForwardEnabled) {
-            try {
-                if (screenshot) {
-                    // Convert base64 to buffer and send as photo
-                    const base64Data = screenshot.replace(/^data:image\/[a-z]+;base64,/, '');
-                    const buffer = Buffer.from(base64Data, 'base64');
-                    
-                    await bot.telegram.sendPhoto(userTelegramId, { source: buffer }, {
-                        caption: message,
-                        parse_mode: 'HTML'
-                    });
-                } else {
-                    await bot.telegram.sendMessage(userTelegramId, message, { parse_mode: 'HTML' });
-                }
-            } catch (botError) {
-                logger.error('Error sending to user:', botError);
+                stats.database_stats = {
+                    total_users: totalUsers,
+                    active_tokens: activeTokens,
+                    total_notifications: totalNotifications
+                };
             }
+
+            res.json(stats);
+
+        } catch (error) {
+            logger.error('❌ Stats error:', error);
+            res.status(500).json({ error: 'Error retrieving statistics' });
         }
+    });
 
-        // Send to group chat
-        if (GROUP_CHAT_ID) {
-            try {
-                await bot.telegram.sendMessage(GROUP_CHAT_ID, message, { parse_mode: 'HTML' });
-            } catch (botError) {
-                logger.error('Error sending to group:', botError);
-            }
-        }
-
-        // Save notification to database
-        const notification = new Notification({
-            userId: userTelegramId,
-            username,
-            data,
-            screenshot: screenshot ? 'included' : 'none',
-            sentAt: new Date(),
-            status: 'sent'
-        });
-
-        await notification.save();
-
-        res.json({
-            success: true,
-            message: 'Notification sent successfully',
-            timestamp: new Date().toISOString()
-        });
-
-        logger.info(`📬 Notification sent for user: ${username}`);
-
-    } catch (error) {
-        logger.error('Send notification error:', error);
-        res.status(500).json({ error: 'Failed to send notification' });
-    }
-});
-
-// API statistics
-app.get('/api/stats', async (req, res) => {
-    try {
-        const totalUsers = await User.countDocuments({});
-        const activeTokens = await User.countDocuments({ accessToken: { $exists: true } });
-        const totalNotifications = await Notification.countDocuments({});
-
-        res.json({
-            total_users: totalUsers,
-            active_tokens: activeTokens,
-            total_notifications: totalNotifications,
-            banned_ips: bannedIPs.size,
-            maintenance_mode: maintenanceMode
-        });
-
-    } catch (error) {
-        logger.error('Stats error:', error);
-        res.status(500).json({ error: 'Error retrieving statistics' });
-    }
-});
-
-// Webhook endpoint (optional)
-app.post('/webhook', (req, res) => {
-    try {
-        bot.handleUpdate(req.body);
-        res.json({ ok: true });
-    } catch (error) {
-        logger.error('Webhook error:', error);
-        res.json({ ok: false });
-    }
-});
+    return app;
+}
 
 // ====================================
-// STARTUP & SHUTDOWN
+// MAIN APPLICATION
 // ====================================
-
-async function startup() {
+async function startApplication() {
     try {
-        // Load banned IPs
-        loadBannedIPs();
+        logger.info('🚀 Starting Telegram Bot Application...');
         
-        // Connect to database
-        await connectDB();
+        // Connect to database with retry
+        let dbConnected = false;
+        const maxRetries = 3;
+        
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            logger.info(`🔄 Database connection attempt ${attempt}/${maxRetries}`);
+            dbConnected = await connectMongoDB();
+            
+            if (dbConnected) {
+                break;
+            } else if (attempt < maxRetries) {
+                logger.info(`⏳ Retrying in 5 seconds...`);
+                await new Promise(resolve => setTimeout(resolve, 5000));
+            }
+        }
+        
+        if (!dbConnected) {
+            logger.warn('⚠️  Starting without database after all attempts failed');
+        }
+        
+        // Setup Telegram bot
+        bot = setupTelegramBot();
+        
+        // Setup Express app
+        app = setupExpressApp();
         
         // Start bot
+        logger.info('🤖 Launching Telegram bot...');
         await bot.launch();
-        logger.info('🤖 Telegram bot started successfully');
+        botStarted = true;
+        logger.info('✅ Telegram bot launched successfully!');
         
         // Start Express server
         app.listen(PORT, () => {
-            logger.info(`🚀 Server running on port ${PORT}`);
-            logger.info(`🌐 Health check: http://localhost:${PORT}/`);
+            logger.info(`🌐 Express server running on port ${PORT}`);
+            logger.info('📱 Bot is ready! Test with /start command');
+            
+            // Print final status
+            logger.info('🎉 Application started successfully!');
+            logger.info(`📊 Database: ${dbConnected ? '✅ Connected' : '❌ Disconnected'}`);
+            logger.info(`🤖 Bot: @pixelhitter_bot`);
+            logger.info(`🌐 API: http://localhost:${PORT}`);
         });
-
+        
     } catch (error) {
-        logger.error('❌ Startup error:', error);
+        logger.error('❌ Application startup failed:', error);
         process.exit(1);
     }
 }
 
-// Graceful shutdown
-function gracefulShutdown() {
-    logger.info('🛑 Graceful shutdown initiated...');
+// ====================================
+// GRACEFUL SHUTDOWN
+// ====================================
+async function gracefulShutdown(signal) {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
     
-    bot.stop('SIGTERM');
-    mongoose.connection.close();
+    logger.info(`🛑 Received ${signal}. Starting graceful shutdown...`);
     
-    logger.info('✅ Shutdown complete');
-    process.exit(0);
+    try {
+        // Stop bot
+        if (bot) {
+            logger.info('🤖 Stopping Telegram bot...');
+            await bot.stop(signal);
+            botStarted = false;
+            logger.info('✅ Telegram bot stopped');
+        }
+        
+        // Close database connection
+        if (mongoClient) {
+            logger.info('🗄️ Closing database connection...');
+            await mongoClient.close();
+            logger.info('✅ Database connection closed');
+        }
+        
+        logger.info('✅ Graceful shutdown completed');
+        process.exit(0);
+        
+    } catch (error) {
+        logger.error('❌ Error during shutdown:', error);
+        process.exit(1);
+    }
 }
 
 // Signal handlers
-process.once('SIGINT', gracefulShutdown);
-process.once('SIGTERM', gracefulShutdown);
+process.once('SIGINT', () => gracefulShutdown('SIGINT'));
+process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
-// Start the application
-startup();
+// Unhandled rejection handler
+process.on('unhandledRejection', (reason, promise) => {
+    logger.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+// Uncaught exception handler
+process.on('uncaughtException', (error) => {
+    logger.error('❌ Uncaught Exception:', error);
+    gracefulShutdown('UNCAUGHT_EXCEPTION');
+});
+
+// ====================================
+// START APPLICATION
+// ====================================
+if (require.main === module) {
+    startApplication();
+}
+
+module.exports = { startApplication, gracefulShutdown };
